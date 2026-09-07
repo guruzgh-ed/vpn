@@ -91,18 +91,10 @@ WsPort='10080'
 # SSLH Port
 MainPort='666' 
 
-# OpenVPN 3 compatible server entry points
-# TunnelGuard exposes the tested five-mode set: TCP, UDP, HTTP Proxy/BShield,
-# SSL Direct and SSL Payload. No dedicated SSL-proxy or generic payload port is needed.
-# TunnelGuard/OpenVPN3 client core stays on Android; the VPS runs standard OpenVPN.
 OPENVPN_TCP_PORT="1194"
 OPENVPN_UDP_PORT="1194"
 OPENVPN_TCP_BACKEND="11940"
-# Dedicated outer TLS port for OpenVPN SSL Direct + SSL Payload.
-# Public 443 remains owned by the existing Xray/SSH stack.
 OPENVPN_SSL_PORT="8433"
-# BShield HTTP Upgrade ingress is loopback-only. Public HTTP traffic reaches it
-# through Xray's /openvpn fallback on ports 80/8080/8880.
 OPENVPN_BSHIELD_PORT="10081"
 
 # SSH SlowDNS
@@ -1781,14 +1773,13 @@ systemctl restart "$NGINX_SERVICE"
 
 rm -rf /etc/squid/squid.con*
 cat <<'mySquid' > /etc/squid/squid.conf
+# Preserve the original SSH script's effective Squid behavior: the proxy may
+# target this VPS/localhost on any service port. Do not apply Safe_ports or
+# SSL_ports gates here because TunnelGuard SSH proxy modes can CONNECT to
+# OpenSSH/Dropbear ports such as 22, 299, 550 and 790.
 acl server dst IP-ADDRESS/32 localhost
-acl SSL_ports port 443 8433 1194
-acl Safe_ports port 80 443 8433 1194 8080 8880 2082 2086 3128 8000
-acl CONNECT method CONNECT
 http_port Squid_Port1
 http_port Squid_Port2
-http_access deny !Safe_ports
-http_access deny CONNECT !SSL_ports
 http_access allow server
 http_access deny all
 visible_hostname IP-ADDRESS
@@ -2953,7 +2944,7 @@ show_xray() {
 
 # --- OPENVPN STANDALONE ACCOUNT MANAGEMENT ---
 openvpn_payload_template() {
-  printf '%s' 'GET /openvpn HTTP/1.1[crlf]Host: [host][crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf][crlf]'
+  printf '%s' 'GET /openvpn HTTP/1.1[crlf]Host: [rlb][crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf][crlf]'
 }
 
 openvpn_bshield_payload_template() {
@@ -2994,7 +2985,7 @@ print_openvpn_generator_details() {
   echo -e " ${BOLD}OVPN TCP:${NC}         ${YELLOW}$OPENVPN_TCP_PORT${NC}"
   echo -e " ${BOLD}OVPN UDP:${NC}         ${YELLOW}$OPENVPN_UDP_PORT${NC}"
   echo -e " ${BOLD}OVPN SSL:${NC}         ${YELLOW}$OPENVPN_SSL_PORT${NC}"
-  echo -e " ${BOLD}BShield:${NC}          ${YELLOW}80, 8080, 8880 via /openvpn -> 127.0.0.1:$OPENVPN_BSHIELD_PORT${NC}"
+  echo -e " ${BOLD}OVPN HTTP Proxy:${NC}  ${YELLOW}80, 8080, 8880 via /openvpn -> 127.0.0.1:$OPENVPN_BSHIELD_PORT${NC}"
   echo -e " ${BOLD}OVPN Username:${NC}    ${YELLOW}$user${NC}"
   echo -e " ${BOLD}OVPN Password:${NC}    ${YELLOW}${pass:-Unavailable - reset password}${NC}"
   echo -e " ${BOLD}Expiry:${NC}           ${YELLOW}$exp${NC}"
@@ -3011,7 +3002,7 @@ print_openvpn_generator_details() {
   echo -e " ${BOLD}TWEAK presets supported by TunnelGuard/OpenVPN3:${NC}"
   echo -e "   TCP Direct              : no extra fields"
   echo -e "   UDP Direct              : no extra fields"
-  echo -e "   HTTP Proxy (BShield)    : ProxyHost=<CDN/origin>, ProxyPort=80"
+  echo -e "   HTTP Proxy              : ProxyHost=<CDN/origin>, ProxyPort=80"
   echo -e "                             Payload = ${YELLOW}$bshield_payload${NC}"
   echo -e "   SSL Direct              : Port=$OPENVPN_SSL_PORT, SNI=[host]"
   echo -e "   SSL Payload             : Port=$OPENVPN_SSL_PORT, SNI=[host]"
@@ -3532,9 +3523,10 @@ draw_header() {
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "WS/PYTHON:" "80, 8080, 8880" "Squid:" "3128, 8000"
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "WS/PYTHON:" "2082, 2086" "BadVPN:" "7300"
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "XRAY TLS:" "443" "XRAY NTLS:" "80, 8080, 8880"
-  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "Hysteria 1:" "20000-50000" "Hysteria 2:" "36713/UDP"
+  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "Hysteria 1:" "20000-50000" "Hysteria 2:" "36713"
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "UDPCustom:" "1-65535" "ZiVPN:" "6000-19999"
-  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "OpenVPN:" "1194 TCP/UDP" "OVPN SSL:" "8433 (BShield /openvpn)"
+  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "OpenVPN:" "1194 TCP/UDP" "OVPN SSL:" "8433"
+  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "OVPN WS:" "80, 8080, 8880" "OVPN SSL/WS:" "8433"
   echo -e "${CYAN}----------------------- ${BOLD}SYSTEM RESOURCES${NC} ${CYAN}-----------------------${NC}"
   printf "  ${WHITE}%-10s${NC} ${YELLOW}%-14s${NC} ${WHITE}%-10s${NC} ${YELLOW}%-10s${NC} ${WHITE}%-8s${NC} ${YELLOW}%s${NC}\n" "RAM Used:" "$ram" "CPU Used:" "$cpu" "Buffer:" "$buf"
   echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
