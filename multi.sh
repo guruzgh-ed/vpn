@@ -92,13 +92,18 @@ WsPort='10080'
 MainPort='666' 
 
 # OpenVPN 3 compatible server entry points
+# TunnelGuard exposes the tested five-mode set: TCP, UDP, HTTP Proxy/BShield,
+# SSL Direct and SSL Payload. No dedicated SSL-proxy or generic payload port is needed.
 # TunnelGuard/OpenVPN3 client core stays on Android; the VPS runs standard OpenVPN.
 OPENVPN_TCP_PORT="1194"
 OPENVPN_UDP_PORT="1194"
 OPENVPN_TCP_BACKEND="11940"
-OPENVPN_SSL_PORT="8443"
-OPENVPN_PAYLOAD_PORT="8081"
-OPENVPN_PROXY_PORT="3128"
+# Dedicated outer TLS port for OpenVPN SSL Direct + SSL Payload.
+# Public 443 remains owned by the existing Xray/SSH stack.
+OPENVPN_SSL_PORT="8433"
+# BShield HTTP Upgrade ingress is loopback-only. Public HTTP traffic reaches it
+# through Xray's /openvpn fallback on ports 80/8080/8880.
+OPENVPN_BSHIELD_PORT="10081"
 
 # SSH SlowDNS
 read -p "Enter SlowDNS Nameserver (or press enter for default): " -e -i "ns-dl.guruzgh.ovh" Nameserver
@@ -822,17 +827,20 @@ EOF_OVPN_UDP
 chmod 600 /etc/openvpn/server/tcp.conf /etc/openvpn/server/udp.conf
 
 # Smart TCP gateway: raw OpenVPN is forwarded untouched. HTTP-like TunnelGuard
-# payload headers are silently removed before the first OpenVPN packet reaches
-# the private TCP backend. No HTTP response is sent to the Android side.
+# payload headers are stripped before the first OpenVPN packet reaches the private
+# TCP backend. Port 1194 is silent after stripping because TunnelGuard supplies
+# the local CONNECT success for SSL wrapper modes. BShield handles HTTP Proxy
+# separately on loopback port 10081. SSL Payload enters Stunnel on 8433 and then
+# uses this silent 1194 gateway.
 cat <<'EOF_OVPN_GATEWAY' > /etc/openvpn/openvpn-gateway.js
 'use strict';
 const net = require('net');
 
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = Number(process.env.OPENVPN_BACKEND || '11940');
-const LISTEN_PORTS = (process.env.OPENVPN_LISTEN_PORTS || '1194,8081')
-  .split(',').map(v => Number(v.trim())).filter(Boolean);
+const LISTEN_PORT = Number(process.env.OPENVPN_LISTEN_PORT || '1194');
 const MAX_HEADER = 65536;
+const MAX_HTTP_BLOCKS = 16;
 const DECISION_TIMEOUT_MS = 5000;
 const CONNECT_TIMEOUT_MS = 15000;
 const METHODS = ['GET ', 'POST ', 'CONNECT ', 'HEAD ', 'PUT ', 'OPTIONS ', 'PATCH ', 'DELETE ', 'TRACE '];
@@ -849,13 +857,16 @@ function headerEnd(buffer) {
   return pos >= 0 ? pos + 2 : -1;
 }
 
-function bridge(client, initial) {
+function bridge(client, initial, strippedBlocks) {
   client.pause();
   const upstream = net.connect({host: BACKEND_HOST, port: BACKEND_PORT});
   let timer = setTimeout(() => upstream.destroy(new Error('backend connect timeout')), CONNECT_TIMEOUT_MS);
   upstream.once('connect', () => {
     clearTimeout(timer);
     timer = null;
+    if (strippedBlocks > 0) {
+      console.log(`OpenVPN gateway ${client.localPort}: stripped ${strippedBlocks} payload header(s)`);
+    }
     if (initial && initial.length) upstream.write(initial);
     client.pipe(upstream);
     upstream.pipe(client);
@@ -875,48 +886,55 @@ function handle(client) {
   client.setNoDelay(true);
   let buffer = Buffer.alloc(0);
   let decided = false;
+  let strippedBlocks = 0;
   const timer = setTimeout(() => {
     if (!decided) client.destroy();
   }, DECISION_TIMEOUT_MS);
 
-  function decideRaw() {
+  function decide(initial) {
     if (decided) return;
     decided = true;
     clearTimeout(timer);
     client.removeListener('data', onFirstData);
-    bridge(client, buffer);
+    bridge(client, initial, strippedBlocks);
+  }
+
+  function processBuffer() {
+    while (!decided) {
+      // Raw OpenVPN TCP starts as binary. Preserve every byte and bridge immediately.
+      if (!payloadPrefix(buffer)) return decide(buffer);
+
+      const end = headerEnd(buffer);
+      if (end < 0) return; // wait for the rest of the injected HTTP block
+
+      strippedBlocks++;
+      if (strippedBlocks > MAX_HTTP_BLOCKS) return client.destroy();
+      buffer = buffer.slice(end); // discard exactly one injected HTTP block
+
+      // SSL Payload receives its local CONNECT success from TunnelGuard. If the
+      // payload arrived in a separate segment, wait for the first OpenVPN byte.
+      if (buffer.length === 0) return;
+      // Otherwise loop: strip another HTTP block or bridge the first binary byte.
+    }
   }
 
   function onFirstData(chunk) {
     if (decided) return;
     buffer = Buffer.concat([buffer, chunk]);
     if (buffer.length > MAX_HEADER) return client.destroy();
-
-    // OpenVPN TCP starts as binary. If the first bytes cannot be an HTTP-style
-    // payload method, forward immediately and preserve every byte.
-    if (!payloadPrefix(buffer)) return decideRaw();
-
-    const end = headerEnd(buffer);
-    if (end >= 0) {
-      decided = true;
-      clearTimeout(timer);
-      client.removeListener('data', onFirstData);
-      bridge(client, buffer.slice(end)); // silently discard injected payload
-    }
+    processBuffer();
   }
 
   client.on('data', onFirstData);
   client.on('error', () => {});
 }
 
-for (const port of LISTEN_PORTS) {
-  const server = net.createServer(handle);
-  server.on('error', err => {
-    console.error(`OpenVPN gateway ${port}: ${err.message}`);
-    process.exitCode = 1;
-  });
-  server.listen(port, '0.0.0.0', () => console.log(`OpenVPN gateway listening on ${port}`));
-}
+const server = net.createServer(handle);
+server.on('error', err => {
+  console.error(`OpenVPN gateway ${LISTEN_PORT}: ${err.message}`);
+  process.exitCode = 1;
+});
+server.listen(LISTEN_PORT, '0.0.0.0', () => console.log(`OpenVPN gateway listening on ${LISTEN_PORT}`));
 EOF_OVPN_GATEWAY
 chmod 644 /etc/openvpn/openvpn-gateway.js
 
@@ -975,7 +993,7 @@ Type=simple
 User=nobody
 Group=nogroup
 Environment=OPENVPN_BACKEND=$OPENVPN_TCP_BACKEND
-Environment=OPENVPN_LISTEN_PORTS=$OPENVPN_TCP_PORT,$OPENVPN_PAYLOAD_PORT
+Environment=OPENVPN_LISTEN_PORT=$OPENVPN_TCP_PORT
 ExecStart=/usr/bin/node /etc/openvpn/openvpn-gateway.js
 Restart=always
 RestartSec=1
@@ -986,6 +1004,134 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF_OVPN_GATEWAY_SERVICE
+
+# BShield-style HTTP Upgrade bridge for CDN/proxy-IP injection.
+# This is intentionally not a strict RFC6455 WebSocket implementation. B SHIELD's
+# working payload sends a simple Upgrade:websocket request without Sec-WebSocket-Key,
+# receives HTTP 101, and then carries the raw OpenVPN TCP stream over the upgraded
+# connection. Keeping this listener loopback-only prevents it from becoming a public
+# open proxy; Xray exposes only the dedicated /openvpn path.
+cat <<'EOF_OVPN_BSHIELD' > /etc/openvpn/openvpn-bshield.js
+'use strict';
+const net = require('net');
+
+const LISTEN_HOST = '127.0.0.1';
+const LISTEN_PORT = Number(process.env.OPENVPN_BSHIELD_PORT || '10081');
+const BACKEND_HOST = '127.0.0.1';
+const BACKEND_PORT = Number(process.env.OPENVPN_BACKEND || '11940');
+const MAX_HEADER = 65536;
+const HEADER_TIMEOUT_MS = 10000;
+const BACKEND_TIMEOUT_MS = 15000;
+const SWITCHING = Buffer.from(
+  'HTTP/1.1 101 Switching Protocols\r\n' +
+  'Connection: Upgrade\r\n' +
+  'Upgrade: websocket\r\n\r\n', 'latin1');
+
+function headerEnd(buf) {
+  let p = buf.indexOf(Buffer.from('\r\n\r\n', 'latin1'));
+  if (p >= 0) return p + 4;
+  p = buf.indexOf(Buffer.from('\n\n', 'latin1'));
+  return p >= 0 ? p + 2 : -1;
+}
+
+function headerToken(text, name, token) {
+  const wanted = name.toLowerCase();
+  const target = token.toLowerCase();
+  for (const line of text.split(/\r?\n/)) {
+    const i = line.indexOf(':');
+    if (i <= 0 || line.slice(0, i).trim().toLowerCase() !== wanted) continue;
+    return line.slice(i + 1).split(',').some(v => v.trim().toLowerCase() === target);
+  }
+  return false;
+}
+
+function reject(client, code, reason) {
+  try { client.end(`HTTP/1.1 ${code} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); }
+  catch (_) { try { client.destroy(); } catch (_) {} }
+}
+
+function handle(client) {
+  client.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  let decided = false;
+  const timer = setTimeout(() => { if (!decided) client.destroy(); }, HEADER_TIMEOUT_MS);
+
+  function onData(chunk) {
+    if (decided) return;
+    buf = Buffer.concat([buf, chunk]);
+    if (buf.length > MAX_HEADER) {
+      decided = true; clearTimeout(timer); reject(client, 431, 'Request Header Fields Too Large'); return;
+    }
+    const end = headerEnd(buf);
+    if (end < 0) return;
+    decided = true;
+    clearTimeout(timer);
+    client.removeListener('data', onData);
+
+    const header = buf.slice(0, end).toString('latin1');
+    const first = (header.split(/\r?\n/, 1)[0] || '').trim();
+    const parts = first.split(/\s+/);
+    const method = (parts[0] || '').toUpperCase();
+    const path = parts[1] || '';
+    const upgrade = headerToken(header, 'Upgrade', 'websocket')
+      && headerToken(header, 'Connection', 'upgrade');
+    if (method !== 'GET' || path !== '/openvpn' || !upgrade) {
+      reject(client, 400, 'Bad Request');
+      return;
+    }
+
+    const leftover = buf.slice(end);
+    const upstream = net.connect({host: BACKEND_HOST, port: BACKEND_PORT});
+    let backendTimer = setTimeout(() => upstream.destroy(new Error('backend connect timeout')), BACKEND_TIMEOUT_MS);
+    upstream.once('connect', () => {
+      clearTimeout(backendTimer); backendTimer = null;
+      client.write(SWITCHING);
+      if (leftover.length) upstream.write(leftover);
+      client.pipe(upstream);
+      upstream.pipe(client);
+      console.log(`BShield OpenVPN upgrade accepted ${client.remoteAddress || ''} -> ${BACKEND_HOST}:${BACKEND_PORT}`);
+    });
+    const close = () => { try { client.destroy(); } catch (_) {} try { upstream.destroy(); } catch (_) {} };
+    client.on('error', close);
+    upstream.on('error', close);
+    client.on('close', () => { try { upstream.destroy(); } catch (_) {} });
+    upstream.on('close', () => { try { client.destroy(); } catch (_) {} });
+  }
+
+  client.on('data', onData);
+  client.on('error', () => {});
+}
+
+const server = net.createServer(handle);
+server.on('error', err => { console.error(`OpenVPN BShield bridge: ${err.message}`); process.exitCode = 1; });
+server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  console.log(`OpenVPN BShield upgrade bridge listening on ${LISTEN_HOST}:${LISTEN_PORT}`);
+});
+EOF_OVPN_BSHIELD
+chmod 644 /etc/openvpn/openvpn-bshield.js
+
+cat <<EOF_OVPN_BSHIELD_SERVICE > /etc/systemd/system/openvpn-bshield.service
+[Unit]
+Description=GuruzGH OpenVPN BShield CDN Upgrade Bridge
+After=network-online.target openvpn-tcp.service
+Wants=network-online.target openvpn-tcp.service
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+Environment=OPENVPN_BACKEND=$OPENVPN_TCP_BACKEND
+Environment=OPENVPN_BSHIELD_PORT=$OPENVPN_BSHIELD_PORT
+ExecStart=/usr/bin/node /etc/openvpn/openvpn-bshield.js
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF_OVPN_BSHIELD_SERVICE
 
 # Persistent forwarding/NAT lifecycle for both OpenVPN address pools.
 cat <<EOF_OVPN_NAT > /usr/local/libexec/openvpn-nat
@@ -998,7 +1144,6 @@ TCP_NET="10.8.0.0/24"
 UDP_NET="10.9.0.0/24"
 TCP_PORT="$OPENVPN_TCP_PORT"
 UDP_PORT="$OPENVPN_UDP_PORT"
-PAYLOAD_PORT="$OPENVPN_PAYLOAD_PORT"
 SSL_PORT="$OPENVPN_SSL_PORT"
 
 add_rule() { iptables -C "\$@" 2>/dev/null || iptables -I "\$@"; }
@@ -1010,7 +1155,6 @@ if [ "\$ACTION" = "start" ]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   add_rule INPUT -p tcp --dport "\$TCP_PORT" -j ACCEPT
   add_rule INPUT -p udp --dport "\$UDP_PORT" -j ACCEPT
-  add_rule INPUT -p tcp --dport "\$PAYLOAD_PORT" -j ACCEPT
   add_rule INPUT -p tcp --dport "\$SSL_PORT" -j ACCEPT
   add_rule FORWARD -s "\$TCP_NET" -j ACCEPT
   add_rule FORWARD -d "\$TCP_NET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -1024,7 +1168,6 @@ fi
 if [ "\$ACTION" = "stop" ]; then
   del_rule INPUT -p tcp --dport "\$TCP_PORT" -j ACCEPT
   del_rule INPUT -p udp --dport "\$UDP_PORT" -j ACCEPT
-  del_rule INPUT -p tcp --dport "\$PAYLOAD_PORT" -j ACCEPT
   del_rule INPUT -p tcp --dport "\$SSL_PORT" -j ACCEPT
   del_rule FORWARD -s "\$TCP_NET" -j ACCEPT
   del_rule FORWARD -d "\$TCP_NET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -1055,7 +1198,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_OVPN_NAT_SERVICE
 
-# Add a dedicated outer TLS listener for TunnelGuard's SSL OpenVPN modes.
+# Dedicated outer TLS listener for OpenVPN SSL Direct + SSL Payload.
+# SSH/Xray keep their existing public 443 architecture untouched.
 if ! grep -q '^\[openvpn-tunnelguard\]$' /etc/stunnel/stunnel.conf; then
   cat <<EOF_OVPN_STUNNEL >> /etc/stunnel/stunnel.conf
 
@@ -1101,20 +1245,26 @@ EOF_OVPN_EXP
 chmod 644 /etc/cron.d/openvpn-expiry
 
 systemctl daemon-reload
-systemctl enable openvpn-nat.service openvpn-tcp.service openvpn-udp.service openvpn-gateway.service
+systemctl enable openvpn-nat.service openvpn-tcp.service openvpn-udp.service openvpn-gateway.service openvpn-bshield.service
 systemctl restart openvpn-nat.service
 systemctl restart openvpn-tcp.service
 systemctl restart openvpn-udp.service
 systemctl restart openvpn-gateway.service
+systemctl restart openvpn-bshield.service
 systemctl restart "$STUNNEL_SERVICE"
 
 # Fail installation early if the core OpenVPN listeners did not come up.
 sleep 1
 if ! systemctl is-active --quiet openvpn-tcp.service || \
    ! systemctl is-active --quiet openvpn-udp.service || \
-   ! systemctl is-active --quiet openvpn-gateway.service; then
-  journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -n 80 --no-pager
-  echo "OpenVPN stack failed to start."
+   ! systemctl is-active --quiet openvpn-gateway.service || \
+   ! systemctl is-active --quiet openvpn-bshield.service || \
+   ! systemctl is-active --quiet "$STUNNEL_SERVICE" || \
+   ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_TCP_PORT$" || \
+   ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_SSL_PORT$" || \
+   ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_BSHIELD_PORT$"; then
+  journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u "$STUNNEL_SERVICE" -n 100 --no-pager
+  echo "OpenVPN stack failed to start or a required listener is missing."
   exit 1
 fi
 
@@ -1231,6 +1381,7 @@ cat <<EOF > /etc/xray/config.json
         "fallbacks": [
           { "path": "/vless", "dest": 10003, "xver": 2 },
           { "path": "/httpupgrade", "dest": 10005, "xver": 2 },
+          { "path": "/openvpn", "dest": $OPENVPN_BSHIELD_PORT, "xver": 0 },
           { "dest": 10080 }
         ]
       },
@@ -1631,8 +1782,8 @@ systemctl restart "$NGINX_SERVICE"
 rm -rf /etc/squid/squid.con*
 cat <<'mySquid' > /etc/squid/squid.conf
 acl server dst IP-ADDRESS/32 localhost
-acl SSL_ports port 443 8443 1194
-acl Safe_ports port 80 443 8443 1194 8080 8081 8880 2082 2086 3128 8000
+acl SSL_ports port 443 8433 1194
+acl Safe_ports port 80 443 8433 1194 8080 8880 2082 2086 3128 8000
 acl CONNECT method CONNECT
 http_port Squid_Port1
 http_port Squid_Port2
@@ -1679,7 +1830,8 @@ if check_port 443 && check_port 10003 && check_port 10004 && check_port 10005 &&
 if check_port 10444 && systemctl is-active --quiet haproxy; then clear_fail haproxy; else restart_after_3_fails haproxy haproxy "internal h2 router 10444"; fi
 if check_port OPENVPNTCPBACKEND && systemctl is-active --quiet openvpn-tcp; then clear_fail openvpn-tcp; else restart_after_3_fails openvpn-tcp openvpn-tcp "OPENVPNTCPBACKEND/TCP backend"; fi
 if check_udp_port OPENVPNUDPPORT && systemctl is-active --quiet openvpn-udp; then clear_fail openvpn-udp; else restart_after_3_fails openvpn-udp openvpn-udp "OPENVPNUDPPORT/UDP"; fi
-if check_port OPENVPNTCPPORT && check_port OPENVPNPAYLOADPORT && systemctl is-active --quiet openvpn-gateway; then clear_fail openvpn-gateway; else restart_after_3_fails openvpn-gateway openvpn-gateway "OPENVPNTCPPORT,OPENVPNPAYLOADPORT/TCP"; fi
+if check_port OPENVPNTCPPORT && systemctl is-active --quiet openvpn-gateway; then clear_fail openvpn-gateway; else restart_after_3_fails openvpn-gateway openvpn-gateway "OPENVPNTCPPORT/TCP"; fi
+if check_port OPENVPNBSHIELDPORT && systemctl is-active --quiet openvpn-bshield; then clear_fail openvpn-bshield; else restart_after_3_fails openvpn-bshield openvpn-bshield "OPENVPNBSHIELDPORT/loopback BShield"; fi
 if check_port OPENVPNSSLPORT && systemctl is-active --quiet stunnel4; then clear_fail openvpn-ssl; else restart_after_3_fails openvpn-ssl stunnel4 "OPENVPNSSLPORT/TCP"; fi
 if systemctl is-active --quiet openvpn-nat; then clear_fail openvpn-nat; else restart_after_3_fails openvpn-nat openvpn-nat "forwarding/NAT"; fi
 if systemctl is-active --quiet hysteria-server; then clear_fail hysteria-server; else restart_after_3_fails hysteria-server hysteria-server "UDP"; fi
@@ -1704,7 +1856,7 @@ sed -i "s|SSHPORT2|$SSH_Port2|g" /etc/deekayvpn/service_checker.sh
 sed -i "s|OPENVPNTCPPORT|$OPENVPN_TCP_PORT|g" /etc/deekayvpn/service_checker.sh
 sed -i "s|OPENVPNUDPPORT|$OPENVPN_UDP_PORT|g" /etc/deekayvpn/service_checker.sh
 sed -i "s|OPENVPNTCPBACKEND|$OPENVPN_TCP_BACKEND|g" /etc/deekayvpn/service_checker.sh
-sed -i "s|OPENVPNPAYLOADPORT|$OPENVPN_PAYLOAD_PORT|g" /etc/deekayvpn/service_checker.sh
+sed -i "s|OPENVPNBSHIELDPORT|$OPENVPN_BSHIELD_PORT|g" /etc/deekayvpn/service_checker.sh
 sed -i "s|OPENVPNSSLPORT|$OPENVPN_SSL_PORT|g" /etc/deekayvpn/service_checker.sh
 
 echo "*/3 * * * * root /bin/bash /etc/deekayvpn/service_checker.sh >/dev/null 2>&1" > /etc/cron.d/service-checker
@@ -2300,9 +2452,8 @@ OPENVPN_PROFILE="/etc/openvpn/client-template.ovpn"
 OPENVPN_TCP_PORT="1194"
 OPENVPN_UDP_PORT="1194"
 OPENVPN_TCP_BACKEND="11940"
-OPENVPN_SSL_PORT="8443"
-OPENVPN_PAYLOAD_PORT="8081"
-OPENVPN_PROXY_PORT="3128"
+OPENVPN_SSL_PORT="8433"
+OPENVPN_BSHIELD_PORT="10081"
 [ -f "$XRAY_SERVER_ENV" ] && source "$XRAY_SERVER_ENV"
 touch "$HYST_USER_DB" "$ZIVPN_USER_DB" /etc/xray/vless.txt 2>/dev/null || true
 
@@ -2330,7 +2481,7 @@ valid_server_name() {
 
 server_status() {
   local ok=0
-  for s in ssh dropbear stunnel4 squid nginx server-sldns hysteria-server hysteria2-server ws-proxy@10080 xray badvpn udp-custom zivpn openvpn-tcp openvpn-udp openvpn-gateway openvpn-nat; do
+  for s in ssh dropbear stunnel4 squid nginx server-sldns hysteria-server hysteria2-server ws-proxy@10080 xray badvpn udp-custom zivpn openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-nat; do
     systemctl is-active --quiet "$s" 2>/dev/null && ok=$((ok+1))
   done
   [ "$ok" -ge 6 ] && echo -e "${GREEN}ONLINE${NC}" || echo -e "${RED}ISSUES DETECTED${NC}"
@@ -2802,7 +2953,11 @@ show_xray() {
 
 # --- OPENVPN STANDALONE ACCOUNT MANAGEMENT ---
 openvpn_payload_template() {
-  printf '%s' 'GET /openvpn HTTP/1.1[crlf]Host: [host][crlf]Connection: keep-alive[crlf][crlf]'
+  printf '%s' 'GET /openvpn HTTP/1.1[crlf]Host: [host][crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf][crlf]'
+}
+
+openvpn_bshield_payload_template() {
+  printf '%s' 'GET /openvpn HTTP/1.1[crlf]Host: [rlb][crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf]Upgrade: websocket[crlf][crlf]'
 }
 
 select_openvpn_user() {
@@ -2829,17 +2984,17 @@ select_openvpn_user() {
 }
 
 print_openvpn_generator_details() {
-  local user="$1" exp="$2" pass payload
+  local user="$1" exp="$2" pass payload bshield_payload
   pass=$(/usr/local/libexec/openvpn-userctl secret "$user" 2>/dev/null || true)
   payload=$(openvpn_payload_template)
+  bshield_payload=$(openvpn_bshield_payload_template)
   clear
   echo -e "${GREEN}════════════════ OPENVPN GENERATOR DETAILS ════════════════${NC}"
   echo -e " ${BOLD}Host:${NC}             ${YELLOW}$DOMAIN${NC}"
   echo -e " ${BOLD}OVPN TCP:${NC}         ${YELLOW}$OPENVPN_TCP_PORT${NC}"
   echo -e " ${BOLD}OVPN UDP:${NC}         ${YELLOW}$OPENVPN_UDP_PORT${NC}"
   echo -e " ${BOLD}OVPN SSL:${NC}         ${YELLOW}$OPENVPN_SSL_PORT${NC}"
-  echo -e " ${BOLD}Payload Gateway:${NC}  ${YELLOW}$OPENVPN_PAYLOAD_PORT${NC}"
-  echo -e " ${BOLD}HTTP Proxy:${NC}       ${YELLOW}$OPENVPN_PROXY_PORT${NC} (also 8000)"
+  echo -e " ${BOLD}BShield:${NC}          ${YELLOW}80, 8080, 8880 via /openvpn -> 127.0.0.1:$OPENVPN_BSHIELD_PORT${NC}"
   echo -e " ${BOLD}OVPN Username:${NC}    ${YELLOW}$user${NC}"
   echo -e " ${BOLD}OVPN Password:${NC}    ${YELLOW}${pass:-Unavailable - reset password}${NC}"
   echo -e " ${BOLD}Expiry:${NC}           ${YELLOW}$exp${NC}"
@@ -2856,15 +3011,11 @@ print_openvpn_generator_details() {
   echo -e " ${BOLD}TWEAK presets supported by TunnelGuard/OpenVPN3:${NC}"
   echo -e "   TCP Direct              : no extra fields"
   echo -e "   UDP Direct              : no extra fields"
-  echo -e "   Direct Payload          : Payload = ${YELLOW}$payload${NC}"
-  echo -e "   HTTP PROXY > PAYLOAD    : ProxyHost=[host] ProxyPort=$OPENVPN_PAYLOAD_PORT"
+  echo -e "   HTTP Proxy (BShield)    : ProxyHost=<CDN/origin>, ProxyPort=80"
+  echo -e "                             Payload = ${YELLOW}$bshield_payload${NC}"
+  echo -e "   SSL Direct              : Port=$OPENVPN_SSL_PORT, SNI=[host]"
+  echo -e "   SSL Payload             : Port=$OPENVPN_SSL_PORT, SNI=[host]"
   echo -e "                             Payload = ${YELLOW}$payload${NC}"
-  echo -e "   Direct SSL              : SNI=[host]"
-  echo -e "   SSL > PAYLOAD           : SNI=[host], Payload = ${YELLOW}$payload${NC}"
-  echo -e "   SSL PROXY > PAYLOAD     : SNI=[host] ProxyHost=[host] ProxyPort=$OPENVPN_SSL_PORT"
-  echo -e "                             Payload = ${YELLOW}$payload${NC}"
-  echo -e "   HTTP PROXY              : ProxyHost=[host] ProxyPort=$OPENVPN_PROXY_PORT, no payload"
-  echo -e "   SSL Proxy               : SNI=[host] ProxyHost=[host] ProxyPort=$OPENVPN_SSL_PORT, no payload"
   echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -3152,13 +3303,13 @@ service_control_menu() {
     echo -e "  [${YELLOW}00${NC}] Back\n"
     read -rp "  Select an option: " opt
     case "$opt" in
-      1|01) restart_service "ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway" "All Services"; pause_return ;;
+      1|01) restart_service "ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield" "All Services"; pause_return ;;
       2|02) restart_service "ssh dropbear" "SSH & Dropbear"; pause_return ;;
       3|03) restart_service "ws-proxy@10080 ws-proxy@2082 ws-proxy@2086" "Node WebSocket Proxies"; pause_return ;;
       4|04) restart_service "stunnel4 xray" "Stunnel & Xray Core"; pause_return ;;
       5|05) restart_service "squid nginx" "Squid Proxy & Nginx"; pause_return ;;
       6|06) restart_service "server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn" "UDP Core Services"; pause_return ;;
-      7|07) restart_service "openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway stunnel4" "OpenVPN Stack"; pause_return ;;
+      7|07) restart_service "openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield stunnel4" "OpenVPN Stack"; pause_return ;;
       0|00) break ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
     esac
@@ -3169,7 +3320,7 @@ service_control_menu() {
 backup_snapshot() {
   clear; local out="/root/guruzgh_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
   echo -e "Packaging server configurations..."
-  tar -czf "$out" /etc/ssh /etc/default/dropbear /etc/stunnel /etc/squid /etc/hysteria /etc/hysteria2 /etc/zivpn /etc/openvpn /root/udp /etc/deekayvpn /etc/systemd/system/ws-proxy@.service /etc/systemd/system/hysteria2-server.service /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-nat.service /etc/xray /etc/haproxy/haproxy.cfg /etc/systemd/system/haproxy.service.d 2>/dev/null
+  tar -czf "$out" /etc/ssh /etc/default/dropbear /etc/stunnel /etc/squid /etc/hysteria /etc/hysteria2 /etc/zivpn /etc/openvpn /root/udp /etc/deekayvpn /etc/systemd/system/ws-proxy@.service /etc/systemd/system/hysteria2-server.service /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service /etc/xray /etc/haproxy/haproxy.cfg /etc/systemd/system/haproxy.service.d 2>/dev/null
   echo -e "\n${GREEN}✔ Backup successfully created!${NC}\nLocation: ${YELLOW}$out${NC}"
   pause_return
 }
@@ -3191,7 +3342,7 @@ restore_snapshot() {
   if [ -n "${backups[$idx]}" ]; then
     echo -e "\nRestoring ${YELLOW}$(basename "${backups[$idx]}")${NC}..."
     tar -xzf "${backups[$idx]}" -C /
-    systemctl daemon-reload; systemctl restart ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray haproxy openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway 2>/dev/null || true
+    systemctl daemon-reload; systemctl restart ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray haproxy openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield 2>/dev/null || true
     echo -e "${GREEN}✔ Restore complete!${NC}"
   else echo -e "${RED}Invalid selection.${NC}"; fi
   pause_return
@@ -3317,7 +3468,7 @@ advanced_menu() {
           8) journalctl -u zivpn -n 50 --no-pager ;;
           9) journalctl -u haproxy -n 50 --no-pager ;;
           10) journalctl -u hysteria2-server -n 50 --no-pager ;;
-          11) journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-nat -n 100 --no-pager ;;
+          11) journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u openvpn-nat -n 100 --no-pager ;;
         esac; pause_return ;;
       3|03) change_domain ;;
       4|04) change_slowdns ;;
@@ -3335,15 +3486,16 @@ remove_script() {
   read -rp "  Are you absolutely sure? [y/N]: " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then
       echo -e "\nStopping services..."
-      systemctl stop ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-tcp openvpn-udp openvpn-nat sslh stunnel4 squid dropbear nginx haproxy xray 2>/dev/null || true
-      systemctl disable ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-tcp openvpn-udp openvpn-nat haproxy xray 2>/dev/null || true
+      systemctl stop ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat sslh stunnel4 squid dropbear nginx haproxy xray 2>/dev/null || true
+      systemctl disable ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat haproxy xray 2>/dev/null || true
       [ -x /usr/local/libexec/openvpn-nat ] && /usr/local/libexec/openvpn-nat stop 2>/dev/null || true
       sed -i '/^\[openvpn-tunnelguard\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf 2>/dev/null || true
+      sed -i '/^\[openvpn-tunnelguard-proxy\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf 2>/dev/null || true
       while iptables -C INPUT -p udp --dport 36713 -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp --dport 36713 -j ACCEPT; done
       netfilter-persistent save >/dev/null 2>&1 || true
       echo "Deleting files..."
       rm -f /etc/systemd/system/ws-proxy@.service /etc/systemd/system/server-sldns.service /etc/systemd/system/badvpn.service /etc/systemd/system/xray.service
-      rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/zivpn.service /etc/systemd/system/zivpn-nat.service /etc/systemd/system/hysteria2-server.service /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-nat.service
+      rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/zivpn.service /etc/systemd/system/zivpn-nat.service /etc/systemd/system/hysteria2-server.service /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service
       rm -f /etc/cron.d/service-checker /etc/cron.d/logrotate /etc/cron.d/xray-expiry /etc/cron.d/hysteria-expiry /etc/cron.d/hysteria2-expiry /etc/cron.d/zivpn-expiry /etc/cron.d/openvpn-expiry /etc/sysctl.d/99-freenet-tuning.conf /etc/security/limits.d/99-freenet.conf
       rm -f /usr/local/bin/xray /usr/local/sbin/xray-install-version /usr/local/bin/exp-check /usr/local/bin/hysteria2 /usr/local/bin/hysteria2-exp /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat
       rm -f /etc/letsencrypt/renewal-hooks/pre/xray-stop.sh /etc/letsencrypt/renewal-hooks/deploy/xray-cert.sh /etc/letsencrypt/renewal-hooks/post/xray-start.sh
@@ -3382,7 +3534,7 @@ draw_header() {
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "XRAY TLS:" "443" "XRAY NTLS:" "80, 8080, 8880"
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "Hysteria 1:" "20000-50000" "Hysteria 2:" "36713/UDP"
   printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "UDPCustom:" "1-65535" "ZiVPN:" "6000-19999"
-  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "OpenVPN:" "1194 TCP/UDP" "OVPN SSL/PY:" "8443 / 8081"
+  printf "  ${WHITE}• %-12s${NC} ${GREEN}%-22s${NC} ${WHITE}• %-13s${NC} ${GREEN}%s${NC}\n" "OpenVPN:" "1194 TCP/UDP" "OVPN SSL:" "8433 (BShield /openvpn)"
   echo -e "${CYAN}----------------------- ${BOLD}SYSTEM RESOURCES${NC} ${CYAN}-----------------------${NC}"
   printf "  ${WHITE}%-10s${NC} ${YELLOW}%-14s${NC} ${WHITE}%-10s${NC} ${YELLOW}%-10s${NC} ${WHITE}%-8s${NC} ${YELLOW}%s${NC}\n" "RAM Used:" "$ram" "CPU Used:" "$cpu" "Buffer:" "$buf"
   echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
