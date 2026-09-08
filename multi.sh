@@ -169,11 +169,13 @@ command -v netfilter-persistent >/dev/null 2>&1 || apt-get install -y netfilter-
 command -v jq >/dev/null 2>&1 || apt-get install -y jq
 command -v curl >/dev/null 2>&1 || apt-get install -y curl
 
-if ! systemctl list-unit-files | grep -q "^${STUNNEL_SERVICE}\.service"; then
-  if systemctl list-unit-files | grep -q "^stunnel\.service"; then STUNNEL_SERVICE="stunnel"; fi
+# Query units directly instead of list-unit-files | grep -q pipelines. With
+# pipefail enabled, grep may exit early and make a valid service look missing.
+if ! systemctl cat "${STUNNEL_SERVICE}.service" >/dev/null 2>&1; then
+  if systemctl cat stunnel.service >/dev/null 2>&1; then STUNNEL_SERVICE="stunnel"; fi
 fi
-if ! systemctl list-unit-files | grep -q "^${SQUID_SERVICE}\.service"; then
-  if systemctl list-unit-files | grep -q "^squid3\.service"; then SQUID_SERVICE="squid3"; fi
+if ! systemctl cat "${SQUID_SERVICE}.service" >/dev/null 2>&1; then
+  if systemctl cat squid3.service >/dev/null 2>&1; then SQUID_SERVICE="squid3"; fi
 fi
 
 PACKAGE_LIST=(
@@ -280,6 +282,7 @@ cat /etc/xray/xray.key /etc/xray/xray.crt > /etc/stunnel/stunnel.pem.new
 install -m 600 /etc/stunnel/stunnel.pem.new /etc/stunnel/stunnel.pem
 rm -f /etc/stunnel/stunnel.pem.new
 systemctl restart stunnel4 2>/dev/null || systemctl restart stunnel
+systemctl restart openvpn-stunnel 2>/dev/null || true
 systemctl restart hysteria2-server 2>/dev/null || true
 EOF_XRAY_CERT_RENEW
   cat <<'EOF_XRAY_CERT_POST' > /etc/letsencrypt/renewal-hooks/post/xray-start.sh
@@ -833,7 +836,9 @@ const BACKEND_PORT = Number(process.env.OPENVPN_BACKEND || '11940');
 const LISTEN_PORT = Number(process.env.OPENVPN_LISTEN_PORT || '1194');
 const MAX_HEADER = 65536;
 const MAX_HTTP_BLOCKS = 16;
-const DECISION_TIMEOUT_MS = 5000;
+// Allow slow/segmented TunnelGuard SSL/payload handshakes up to 15 seconds before
+// abandoning an undecided connection. Backend connect timeout remains 15 seconds.
+const DECISION_TIMEOUT_MS = 15000;
 const CONNECT_TIMEOUT_MS = 15000;
 const METHODS = ['GET ', 'POST ', 'CONNECT ', 'HEAD ', 'PUT ', 'OPTIONS ', 'PATCH ', 'DELETE ', 'TRACE '];
 
@@ -1190,17 +1195,62 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_OVPN_NAT_SERVICE
 
-# Dedicated outer TLS listener for OpenVPN SSL Direct + SSL Payload.
-# SSH/Xray keep their existing public 443 architecture untouched.
-if ! grep -q '^\[openvpn-tunnelguard\]$' /etc/stunnel/stunnel.conf; then
-  cat <<EOF_OVPN_STUNNEL >> /etc/stunnel/stunnel.conf
+# Dedicated raw-TLS ingress for OpenVPN SSL Direct + SSL Payload.
+# Architecture: public :8433 -> openvpn-stunnel -> 127.0.0.1:1194 gateway ->
+# 127.0.0.1:11940 OpenVPN TCP backend. This path NEVER enters Xray/public :443.
+# IMPORTANT: OpenVPN has its own Stunnel process/service. The SSH Stunnel
+# configuration remains SSH-only, matching the pre-OpenVPN layout.
+# If this installer is re-run over an older combined setup, remove the legacy
+# OpenVPN section from the shared SSH Stunnel config and restart SSH Stunnel
+# once so port 8433 can move cleanly to openvpn-stunnel.service.
+OPENVPN_STUNNEL_WAS_SHARED=0
+if grep -q '^\[openvpn-tunnelguard\]$' /etc/stunnel/stunnel.conf 2>/dev/null; then
+  sed -i '/^\[openvpn-tunnelguard\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf
+  OPENVPN_STUNNEL_WAS_SHARED=1
+fi
+if grep -q '^\[openvpn-tunnelguard-proxy\]$' /etc/stunnel/stunnel.conf 2>/dev/null; then
+  sed -i '/^\[openvpn-tunnelguard-proxy\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf
+  OPENVPN_STUNNEL_WAS_SHARED=1
+fi
+
+OPENVPN_STUNNEL_BIN="$(command -v stunnel4 2>/dev/null || command -v stunnel 2>/dev/null || true)"
+[ -n "$OPENVPN_STUNNEL_BIN" ] || { echo "Stunnel binary not found for OpenVPN SSL transport."; exit 1; }
+
+cat > /etc/openvpn/openvpn-stunnel.conf <<EOF_OVPN_STUNNEL_CONF
+foreground = yes
+pid = /run/openvpn-stunnel.pid
+cert = /etc/stunnel/stunnel.pem
+client = no
+syslog = no
+debug = 0
+output = /dev/null
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+TIMEOUTclose = 0
 
 [openvpn-tunnelguard]
 accept = 0.0.0.0:$OPENVPN_SSL_PORT
 connect = 127.0.0.1:$OPENVPN_TCP_PORT
-TIMEOUTclose = 0
-EOF_OVPN_STUNNEL
-fi
+EOF_OVPN_STUNNEL_CONF
+chmod 600 /etc/openvpn/openvpn-stunnel.conf
+
+cat > /etc/systemd/system/openvpn-stunnel.service <<EOF_OVPN_STUNNEL_SERVICE
+[Unit]
+Description=GuruzGH Dedicated OpenVPN Stunnel TLS Transport
+After=network-online.target openvpn-gateway.service
+Wants=network-online.target openvpn-gateway.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=$OPENVPN_STUNNEL_BIN /etc/openvpn/openvpn-stunnel.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF_OVPN_STUNNEL_SERVICE
 
 # One reusable OpenVPN profile per VPS. TunnelGuard supplies the standalone
 # username/password separately and overrides host/port/proto for each tweak.
@@ -1237,13 +1287,18 @@ EOF_OVPN_EXP
 chmod 644 /etc/cron.d/openvpn-expiry
 
 systemctl daemon-reload
-systemctl enable openvpn-nat.service openvpn-tcp.service openvpn-udp.service openvpn-gateway.service openvpn-bshield.service
+# A re-run over the old shared-Stunnel layout needs one SSH Stunnel restart to
+# release 8433. After this migration, OpenVPN restarts never touch SSH Stunnel.
+if [ "$OPENVPN_STUNNEL_WAS_SHARED" -eq 1 ]; then
+  systemctl restart "$STUNNEL_SERVICE"
+fi
+systemctl enable openvpn-nat.service openvpn-tcp.service openvpn-udp.service openvpn-gateway.service openvpn-bshield.service openvpn-stunnel.service
 systemctl restart openvpn-nat.service
 systemctl restart openvpn-tcp.service
 systemctl restart openvpn-udp.service
 systemctl restart openvpn-gateway.service
 systemctl restart openvpn-bshield.service
-systemctl restart "$STUNNEL_SERVICE"
+systemctl restart openvpn-stunnel.service
 
 # Fail installation early if the core OpenVPN listeners did not come up.
 sleep 1
@@ -1251,11 +1306,11 @@ if ! systemctl is-active --quiet openvpn-tcp.service || \
    ! systemctl is-active --quiet openvpn-udp.service || \
    ! systemctl is-active --quiet openvpn-gateway.service || \
    ! systemctl is-active --quiet openvpn-bshield.service || \
-   ! systemctl is-active --quiet "$STUNNEL_SERVICE" || \
+   ! systemctl is-active --quiet openvpn-stunnel.service || \
    ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_TCP_PORT$" || \
    ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_SSL_PORT$" || \
    ! ss -lnt | awk '{print $4}' | grep -q ":$OPENVPN_BSHIELD_PORT$"; then
-  journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u "$STUNNEL_SERVICE" -n 100 --no-pager
+  journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u openvpn-stunnel -n 100 --no-pager
   echo "OpenVPN stack failed to start or a required listener is missing."
   exit 1
 fi
@@ -1823,7 +1878,7 @@ if check_port OPENVPNTCPBACKEND && systemctl is-active --quiet openvpn-tcp; then
 if check_udp_port OPENVPNUDPPORT && systemctl is-active --quiet openvpn-udp; then clear_fail openvpn-udp; else restart_after_3_fails openvpn-udp openvpn-udp "OPENVPNUDPPORT/UDP"; fi
 if check_port OPENVPNTCPPORT && systemctl is-active --quiet openvpn-gateway; then clear_fail openvpn-gateway; else restart_after_3_fails openvpn-gateway openvpn-gateway "OPENVPNTCPPORT/TCP"; fi
 if check_port OPENVPNBSHIELDPORT && systemctl is-active --quiet openvpn-bshield; then clear_fail openvpn-bshield; else restart_after_3_fails openvpn-bshield openvpn-bshield "OPENVPNBSHIELDPORT/loopback BShield"; fi
-if check_port OPENVPNSSLPORT && systemctl is-active --quiet stunnel4; then clear_fail openvpn-ssl; else restart_after_3_fails openvpn-ssl stunnel4 "OPENVPNSSLPORT/TCP"; fi
+if check_port OPENVPNSSLPORT && systemctl is-active --quiet openvpn-stunnel; then clear_fail openvpn-ssl; else restart_after_3_fails openvpn-ssl openvpn-stunnel "OPENVPNSSLPORT/TCP"; fi
 if systemctl is-active --quiet openvpn-nat; then clear_fail openvpn-nat; else restart_after_3_fails openvpn-nat openvpn-nat "forwarding/NAT"; fi
 if systemctl is-active --quiet hysteria-server; then clear_fail hysteria-server; else restart_after_3_fails hysteria-server hysteria-server "UDP"; fi
 if check_udp_port 36713 && systemctl is-active --quiet hysteria2-server; then clear_fail hysteria2-server; else restart_after_3_fails hysteria2-server hysteria2-server "36713/UDP"; fi
@@ -2472,7 +2527,7 @@ valid_server_name() {
 
 server_status() {
   local ok=0
-  for s in ssh dropbear stunnel4 squid nginx server-sldns hysteria-server hysteria2-server ws-proxy@10080 xray badvpn udp-custom zivpn openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-nat; do
+  for s in ssh dropbear stunnel4 squid nginx server-sldns hysteria-server hysteria2-server ws-proxy@10080 xray badvpn udp-custom zivpn openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-nat openvpn-stunnel; do
     systemctl is-active --quiet "$s" 2>/dev/null && ok=$((ok+1))
   done
   [ "$ok" -ge 6 ] && echo -e "${GREEN}ONLINE${NC}" || echo -e "${RED}ISSUES DETECTED${NC}"
@@ -2984,7 +3039,7 @@ print_openvpn_generator_details() {
   echo -e " ${BOLD}Host:${NC}             ${YELLOW}$DOMAIN${NC}"
   echo -e " ${BOLD}OVPN TCP:${NC}         ${YELLOW}$OPENVPN_TCP_PORT${NC}"
   echo -e " ${BOLD}OVPN UDP:${NC}         ${YELLOW}$OPENVPN_UDP_PORT${NC}"
-  echo -e " ${BOLD}OVPN SSL:${NC}         ${YELLOW}$OPENVPN_SSL_PORT${NC}"
+  echo -e " ${BOLD}OVPN SSL:${NC}         ${YELLOW}$OPENVPN_SSL_PORT${NC} ${WHITE}(dedicated raw TLS; bypasses Xray :443)${NC}"
   echo -e " ${BOLD}OVPN HTTP Proxy:${NC}  ${YELLOW}80, 8080, 8880 via /openvpn -> 127.0.0.1:$OPENVPN_BSHIELD_PORT${NC}"
   echo -e " ${BOLD}OVPN Username:${NC}    ${YELLOW}$user${NC}"
   echo -e " ${BOLD}OVPN Password:${NC}    ${YELLOW}${pass:-Unavailable - reset password}${NC}"
@@ -3294,13 +3349,13 @@ service_control_menu() {
     echo -e "  [${YELLOW}00${NC}] Back\n"
     read -rp "  Select an option: " opt
     case "$opt" in
-      1|01) restart_service "ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield" "All Services"; pause_return ;;
+      1|01) restart_service "ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-stunnel" "All Services"; pause_return ;;
       2|02) restart_service "ssh dropbear" "SSH & Dropbear"; pause_return ;;
       3|03) restart_service "ws-proxy@10080 ws-proxy@2082 ws-proxy@2086" "Node WebSocket Proxies"; pause_return ;;
       4|04) restart_service "stunnel4 xray" "Stunnel & Xray Core"; pause_return ;;
       5|05) restart_service "squid nginx" "Squid Proxy & Nginx"; pause_return ;;
       6|06) restart_service "server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn" "UDP Core Services"; pause_return ;;
-      7|07) restart_service "openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield stunnel4" "OpenVPN Stack"; pause_return ;;
+      7|07) restart_service "openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-stunnel" "OpenVPN Stack"; pause_return ;;
       0|00) break ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
     esac
@@ -3311,7 +3366,7 @@ service_control_menu() {
 backup_snapshot() {
   clear; local out="/root/guruzgh_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
   echo -e "Packaging server configurations..."
-  tar -czf "$out" /etc/ssh /etc/default/dropbear /etc/stunnel /etc/squid /etc/hysteria /etc/hysteria2 /etc/zivpn /etc/openvpn /root/udp /etc/deekayvpn /etc/systemd/system/ws-proxy@.service /etc/systemd/system/hysteria2-server.service /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service /etc/xray /etc/haproxy/haproxy.cfg /etc/systemd/system/haproxy.service.d 2>/dev/null
+  tar -czf "$out" /etc/ssh /etc/default/dropbear /etc/stunnel /etc/squid /etc/hysteria /etc/hysteria2 /etc/zivpn /etc/openvpn /root/udp /etc/deekayvpn /etc/systemd/system/ws-proxy@.service /etc/systemd/system/hysteria2-server.service /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service /etc/systemd/system/openvpn-stunnel.service /etc/xray /etc/haproxy/haproxy.cfg /etc/systemd/system/haproxy.service.d 2>/dev/null
   echo -e "\n${GREEN}✔ Backup successfully created!${NC}\nLocation: ${YELLOW}$out${NC}"
   pause_return
 }
@@ -3333,7 +3388,7 @@ restore_snapshot() {
   if [ -n "${backups[$idx]}" ]; then
     echo -e "\nRestoring ${YELLOW}$(basename "${backups[$idx]}")${NC}..."
     tar -xzf "${backups[$idx]}" -C /
-    systemctl daemon-reload; systemctl restart ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray haproxy openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield 2>/dev/null || true
+    systemctl daemon-reload; systemctl restart ssh dropbear stunnel4 sslh squid nginx server-sldns hysteria-server hysteria2-server badvpn udp-custom zivpn ws-proxy@10080 ws-proxy@2082 ws-proxy@2086 xray haproxy openvpn-nat openvpn-tcp openvpn-udp openvpn-gateway openvpn-bshield openvpn-stunnel 2>/dev/null || true
     echo -e "${GREEN}✔ Restore complete!${NC}"
   else echo -e "${RED}Invalid selection.${NC}"; fi
   pause_return
@@ -3459,7 +3514,7 @@ advanced_menu() {
           8) journalctl -u zivpn -n 50 --no-pager ;;
           9) journalctl -u haproxy -n 50 --no-pager ;;
           10) journalctl -u hysteria2-server -n 50 --no-pager ;;
-          11) journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u openvpn-nat -n 100 --no-pager ;;
+          11) journalctl -u openvpn-tcp -u openvpn-udp -u openvpn-gateway -u openvpn-bshield -u openvpn-stunnel -u openvpn-nat -n 100 --no-pager ;;
         esac; pause_return ;;
       3|03) change_domain ;;
       4|04) change_slowdns ;;
@@ -3477,8 +3532,8 @@ remove_script() {
   read -rp "  Are you absolutely sure? [y/N]: " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then
       echo -e "\nStopping services..."
-      systemctl stop ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat sslh stunnel4 squid dropbear nginx haproxy xray 2>/dev/null || true
-      systemctl disable ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat haproxy xray 2>/dev/null || true
+      systemctl stop ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat openvpn-stunnel sslh stunnel4 squid dropbear nginx haproxy xray 2>/dev/null || true
+      systemctl disable ws-proxy@* server-sldns badvpn hysteria-server hysteria2-server udp-custom zivpn openvpn-gateway openvpn-bshield openvpn-tcp openvpn-udp openvpn-nat openvpn-stunnel haproxy xray 2>/dev/null || true
       [ -x /usr/local/libexec/openvpn-nat ] && /usr/local/libexec/openvpn-nat stop 2>/dev/null || true
       sed -i '/^\[openvpn-tunnelguard\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf 2>/dev/null || true
       sed -i '/^\[openvpn-tunnelguard-proxy\]$/,/^TIMEOUTclose = 0$/d' /etc/stunnel/stunnel.conf 2>/dev/null || true
@@ -3486,7 +3541,7 @@ remove_script() {
       netfilter-persistent save >/dev/null 2>&1 || true
       echo "Deleting files..."
       rm -f /etc/systemd/system/ws-proxy@.service /etc/systemd/system/server-sldns.service /etc/systemd/system/badvpn.service /etc/systemd/system/xray.service
-      rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/zivpn.service /etc/systemd/system/zivpn-nat.service /etc/systemd/system/hysteria2-server.service /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service
+      rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/zivpn.service /etc/systemd/system/zivpn-nat.service /etc/systemd/system/hysteria2-server.service /etc/systemd/system/openvpn-tcp.service /etc/systemd/system/openvpn-udp.service /etc/systemd/system/openvpn-gateway.service /etc/systemd/system/openvpn-bshield.service /etc/systemd/system/openvpn-nat.service /etc/systemd/system/openvpn-stunnel.service
       rm -f /etc/cron.d/service-checker /etc/cron.d/logrotate /etc/cron.d/xray-expiry /etc/cron.d/hysteria-expiry /etc/cron.d/hysteria2-expiry /etc/cron.d/zivpn-expiry /etc/cron.d/openvpn-expiry /etc/sysctl.d/99-freenet-tuning.conf /etc/security/limits.d/99-freenet.conf
       rm -f /usr/local/bin/xray /usr/local/sbin/xray-install-version /usr/local/bin/exp-check /usr/local/bin/hysteria2 /usr/local/bin/hysteria2-exp /usr/local/libexec/hysteria2-auth /usr/local/libexec/openvpn-auth /usr/local/libexec/openvpn-userctl /usr/local/libexec/openvpn-nat
       rm -f /etc/letsencrypt/renewal-hooks/pre/xray-stop.sh /etc/letsencrypt/renewal-hooks/deploy/xray-cert.sh /etc/letsencrypt/renewal-hooks/post/xray-start.sh
